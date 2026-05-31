@@ -464,12 +464,15 @@ async def _generate_questions_batch(topics: List[str], diff_map: dict, grade: in
         f"Generate exactly {batch_size} multiple-choice questions (batch #{batch_idx + 1}), "
         f"appropriate for Grade {grade}, spread across these {len(topics)} topics: {topics}. "
         f"{_diff_map_brief(diff_map, grade)}\n"
+        "VARIETY IS CRITICAL. Every single question MUST differ from every other question in this batch in BOTH the prompt wording AND the underlying concept being tested. "
+        "Use a wide MIX of question STYLES: direct question, riddle, real-life word problem with Indian names (Aarav/Diya/Rishi/Meera/Aanya), scenario with a hint, fill-in-the-blank, 'which is true', 'which is FALSE', 'odd-one-out', 'next in pattern'. "
+        "Across the batch, no two questions should test the same exact fact or use the same numbers. Rotate which topic comes next so the batch doesn't cluster on one topic. "
         "Subject diversity: include questions across math, time, hindi, english, science, geography. "
         "No 70%+ single subject. "
         "All distractors must be plausible common student mistakes. "
-        "Vary wording (riddle, scenario, direct question, real-life example with Indian names like Aarav/Diya/Rishi, word problem). "
-        "No duplicate prompts. Keep prompts <35 words. Keep options <8 words. "
+        "No duplicate prompts. No prompts that paraphrase each other. Keep prompts <35 words. Keep options <8 words. "
         "DIFFICULTY SELF-AUDIT: before finalising, ask 'Is this actually hard enough for its level? If a strong student solves in <30s without writing, REPLACE.' "
+        "DUPLICATE SELF-AUDIT: before returning, scan your own list — if any two prompts test the same concept or share >50% of the same words, REPLACE the later one. "
         f"{QUESTION_GEN_SCHEMA}"
     )
     try:
@@ -482,11 +485,27 @@ async def _generate_questions_batch(topics: List[str], diff_map: dict, grade: in
     if not isinstance(raw, list):
         return []
     out: List[GeneratedQuestion] = []
+    seen_keys: set = set()
     for i, q in enumerate(raw):
         coerced = _coerce_question(q, batch_idx, i)
-        if coerced:
-            out.append(coerced)
+        if not coerced:
+            continue
+        key = _q_dedup_key(coerced.prompt, coerced.options)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(coerced)
     return out
+
+
+def _q_dedup_key(prompt: str, options: List[str]) -> str:
+    """Normalised key used to detect duplicate questions inside and across batches.
+    Includes prompt + sorted options so two questions that just shuffle options
+    are detected as duplicates, while procedurally-generated questions with the
+    same template but different numerics still pass through."""
+    p = " ".join((prompt or "").strip().lower().split())
+    opts = "|".join(sorted([(o or "").strip().lower() for o in options]))
+    return f"{p}||{opts}"
 
 
 async def _fill_curriculum_in_background(curriculum_id: str, topics: List[str], diff_map: dict, grade: int, target: int) -> None:
@@ -512,14 +531,17 @@ async def _fill_curriculum_in_background(curriculum_id: str, topics: List[str], 
                     return
                 await asyncio.sleep(2)
                 continue
-            # Dedupe by normalized prompt
-            existing_prompts = {(q.get("prompt") or "").strip().lower() for q in doc.get("questions", [])}
+            # Dedupe by composite key (normalized prompt + sorted options)
+            existing_keys = {
+                _q_dedup_key(q.get("prompt") or "", q.get("options") or [])
+                for q in doc.get("questions", [])
+            }
             unique_new = []
             for q in new_qs:
-                key = q.prompt.strip().lower()
-                if not key or key in existing_prompts:
+                key = _q_dedup_key(q.prompt, q.options)
+                if not key or key in existing_keys:
                     continue
-                existing_prompts.add(key)
+                existing_keys.add(key)
                 unique_new.append(q)
             if not unique_new:
                 failed += 1
