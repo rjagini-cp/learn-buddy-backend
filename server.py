@@ -52,7 +52,7 @@ Difficulty = Literal["easy", "medium", "hard", "ap"]
 
 INITIAL_BATCH = 30
 GEN_BATCH_SIZE = 40
-MAX_TARGET = 1500
+MAX_TARGET = 3000
 MIN_TARGET = 10
 MAX_FAILED_BATCHES = 4
 
@@ -261,27 +261,70 @@ async def regenerate_curriculum_questions(
     target = max(MIN_TARGET, min(MAX_TARGET, int(pool_size)))
     diff_map = _parse_diff_map(difficulties, difficulty)
     grade = int(doc.get("grade", 3))
-    first_count = min(INITIAL_BATCH, target)
-    first_batch = await _generate_questions_batch(doc["topics"], diff_map, grade, first_count, 0)
-    if not first_batch:
+
+    # Existing pool — we APPEND to this rather than replace, so each tap of
+    # "Update & Regenerate" GROWS the variety instead of starting over.
+    existing_questions: List[dict] = list(doc.get("questions") or [])
+    existing_keys: set = {
+        _q_dedup_key(q.get("prompt") or "", q.get("options") or [])
+        for q in existing_questions
+    }
+    anti_examples = _build_anti_examples(existing_questions)
+
+    first_count = min(INITIAL_BATCH, max(0, target - len(existing_questions)) or INITIAL_BATCH)
+    first_batch = await _generate_questions_batch(
+        doc["topics"], diff_map, grade, first_count, 0, anti_examples=anti_examples,
+    )
+    if not first_batch and not existing_questions:
         raise HTTPException(502, "AI returned no usable questions")
-    status = "ready" if len(first_batch) >= target else "generating"
+
+    # Dedupe newly returned batch against the existing pool.
+    fresh = []
+    for q in first_batch:
+        k = _q_dedup_key(q.prompt, q.options)
+        if k in existing_keys:
+            continue
+        existing_keys.add(k)
+        fresh.append(q)
+
+    merged = existing_questions + [q.dict() for q in fresh]
+    # Cap at target so the pool doesn't grow unbounded across many taps.
+    new_target = max(target, len(merged))
+    new_target = min(new_target, MAX_TARGET)
+    status = "ready" if len(merged) >= new_target else "generating"
+
     await db.curricula.update_one(
         {"id": curriculum_id},
-        {"$set": {"difficulty_map": diff_map, "target_size": target, "status": status,
-                  "questions": [q.dict() for q in first_batch]}},
+        {"$set": {"difficulty_map": diff_map, "target_size": new_target,
+                  "status": status, "questions": merged}},
     )
     if status == "generating":
         background_tasks.add_task(
             _fill_curriculum_in_background,
             curriculum_id=curriculum_id, topics=doc["topics"], diff_map=diff_map,
-            grade=grade, target=target,
+            grade=grade, target=new_target,
         )
     return CurriculumStatusOut(
         id=curriculum_id, file_name=doc.get("file_name", "curriculum"),
-        topics=doc["topics"], grade=grade, pool_size=len(first_batch),
-        target_size=target, status=status,
+        topics=doc["topics"], grade=grade, pool_size=len(merged),
+        target_size=new_target, status=status,
     )
+
+
+def _build_anti_examples(existing_questions: List[dict], k: int = 30) -> List[str]:
+    """Take a random sample of existing prompts and return them as short
+    anti-example strings to feed to Gemini so it doesn't regenerate them."""
+    if not existing_questions:
+        return []
+    import random
+    sample = random.sample(existing_questions, min(k, len(existing_questions)))
+    out: List[str] = []
+    for q in sample:
+        p = (q.get("prompt") or "").strip()
+        if not p:
+            continue
+        out.append(p[:120])
+    return out
 
 
 @api_router.delete("/curriculum/{curriculum_id}")
@@ -451,7 +494,10 @@ def _coerce_question(raw_q: dict, batch_idx: int, item_idx: int) -> Optional[Gen
     )
 
 
-async def _generate_questions_batch(topics: List[str], diff_map: dict, grade: int, batch_size: int, batch_idx: int) -> List[GeneratedQuestion]:
+async def _generate_questions_batch(
+    topics: List[str], diff_map: dict, grade: int, batch_size: int, batch_idx: int,
+    anti_examples: Optional[List[str]] = None,
+) -> List[GeneratedQuestion]:
     batch_size = max(1, min(80, batch_size))
     chat = await _gemini_chat(
         session_id=f"qgen-{uuid.uuid4()}",
@@ -460,10 +506,35 @@ async def _generate_questions_batch(topics: List[str], diff_map: dict, grade: in
             "Output strictly valid JSON. Do NOT repeat questions from earlier batches."
         ),
     )
+
+    # Honour the user's preference: if every subject in the diff_map is set to
+    # hard/ap, the prompt explicitly forbids easy/medium output. Many users
+    # (this one in particular) "almost never use easy" — defend against Gemini
+    # silently watering down the level.
+    levels = set(diff_map.values()) if diff_map else set()
+    only_advanced = levels.issubset({"hard", "ap"}) and len(levels) > 0
+    advanced_clause = (
+        "STRICT DIFFICULTY FLOOR: every question MUST be hard or AP-level. "
+        "If you find yourself writing a 1-step recall question, DELETE IT and replace it with a "
+        "multi-step reasoning, inference, word-problem, or pattern question. "
+        if only_advanced else ""
+    )
+
+    anti_clause = ""
+    if anti_examples:
+        sample = "\n".join(f"- {p}" for p in anti_examples[:30])
+        anti_clause = (
+            "DO NOT regenerate any of these existing questions (or close paraphrases of them):\n"
+            f"{sample}\n"
+            "Produce questions on DIFFERENT angles, different numbers, different scenarios.\n"
+        )
+
     prompt = (
         f"Generate exactly {batch_size} multiple-choice questions (batch #{batch_idx + 1}), "
         f"appropriate for Grade {grade}, spread across these {len(topics)} topics: {topics}. "
         f"{_diff_map_brief(diff_map, grade)}\n"
+        f"{advanced_clause}"
+        f"{anti_clause}"
         "VARIETY IS CRITICAL. Every single question MUST differ from every other question in this batch in BOTH the prompt wording AND the underlying concept being tested. "
         "Use a wide MIX of question STYLES: direct question, riddle, real-life word problem with Indian names (Aarav/Diya/Rishi/Meera/Aanya), scenario with a hint, fill-in-the-blank, 'which is true', 'which is FALSE', 'odd-one-out', 'next in pattern'. "
         "Across the batch, no two questions should test the same exact fact or use the same numbers. Rotate which topic comes next so the batch doesn't cluster on one topic. "
@@ -516,13 +587,19 @@ async def _fill_curriculum_in_background(curriculum_id: str, topics: List[str], 
             doc = await db.curricula.find_one({"id": curriculum_id}, {"questions": 1, "_id": 0})
             if not doc:
                 return
-            current = len(doc.get("questions", []))
+            current_questions = doc.get("questions", []) or []
+            current = len(current_questions)
             if current >= target:
                 await db.curricula.update_one({"id": curriculum_id}, {"$set": {"status": "ready"}})
                 return
             need = target - current
             this_batch = min(GEN_BATCH_SIZE, need)
-            new_qs = await _generate_questions_batch(topics, diff_map, grade, this_batch, batch_idx)
+            # Feed each successive batch a fresh sample of the existing pool as
+            # "do-not-repeat" anti-examples — keeps the new batch varied.
+            anti = _build_anti_examples(current_questions)
+            new_qs = await _generate_questions_batch(
+                topics, diff_map, grade, this_batch, batch_idx, anti_examples=anti,
+            )
             batch_idx += 1
             if not new_qs:
                 failed += 1
