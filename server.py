@@ -333,6 +333,32 @@ async def delete_curriculum(curriculum_id: str):
     return {"ok": True}
 
 
+@api_router.post("/curriculum/{curriculum_id}/deduplicate")
+async def deduplicate_curriculum_pool(curriculum_id: str):
+    """One-shot cleanup: runs the composite-key dedup across the existing pool
+    and drops near-paraphrase duplicates that the OLD generator let through.
+    Returns counts so the frontend can show 'cleaned X -> Y'."""
+    doc = await db.curricula.find_one({"id": curriculum_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Curriculum not found")
+    questions = list(doc.get("questions") or [])
+    before = len(questions)
+    seen_keys: set = set()
+    cleaned: List[dict] = []
+    for q in questions:
+        k = _q_dedup_key(q.get("prompt") or "", q.get("options") or [])
+        if not k or k in seen_keys:
+            continue
+        seen_keys.add(k)
+        cleaned.append(q)
+    after = len(cleaned)
+    await db.curricula.update_one(
+        {"id": curriculum_id},
+        {"$set": {"questions": cleaned}},
+    )
+    return {"id": curriculum_id, "before": before, "after": after, "removed": before - after}
+
+
 TOPIC_EXTRACTION_PROMPT = (
     "You are reading a school curriculum document. "
     "1) Detect the target GRADE LEVEL (integer 1..12). PYP X = grade X. If unclear default 3. "
